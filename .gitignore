@@ -1,0 +1,43 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+src/logs/
+*.log
+
+# Runtime data outputs (generated daily)
+assembled/
+market/
+stocks/
+lhb/
+concepts/daily_hot/
+concepts/stock_concept_map.md
+
+# Local secrets / overrides
+.env
+.env.*
+
+# Packaging
+build/
+dist/
+*.egg-info/
