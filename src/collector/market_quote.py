@@ -28,9 +28,11 @@ logger = logging.getLogger(__name__)
 
 TENCENT_URL   = "https://qt.gtimg.cn/q={symbols}"
 BATCH_SIZE    = 50      # 每次请求股票数量
-BATCH_DELAY   = 0.5     # 批次间隔（秒），避免被封
-MAX_RETRIES   = 3
-RETRY_DELAY   = 5
+BATCH_DELAY   = 0.8     # 批次间隔（秒），避免被封
+MAX_RETRIES   = 5
+RETRY_DELAY   = 6
+REQUEST_CONNECT_TIMEOUT = 10
+REQUEST_MAX_TIME = 30
 
 # 涨跌停幅度
 NORMAL_LIMIT  = 0.10    # 普通股 ±10%
@@ -82,7 +84,7 @@ def _fetch_tencent_batch(symbols: list[str], retries: int = MAX_RETRIES) -> str:
     for attempt in range(1, retries + 1):
         try:
             result = subprocess.run(
-                ["curl", "-s", "--max-time", "10", url],
+                ["curl", "-s", "--connect-timeout", str(REQUEST_CONNECT_TIMEOUT), "--max-time", str(REQUEST_MAX_TIME), url],
                 capture_output=True
             )
             if result.returncode != 0:
@@ -331,4 +333,6 @@ def run(d: date = None):
         logger.error("[market_quote] 未采集到任何数据")
         return
     save_market_quote(stocks, d)
+
+
 
