@@ -18,6 +18,7 @@ def run_full_pipeline(d: date):
         ("行情采集",       "collector.market_quote",  "run", []),
         ("北向资金",       "collector.northbound",    "run", []),
         ("涨停列表",       "collector.limit_up",      "run", []),
+        ("热点概念",       "collector.concepts",      "run", []),
         ("龙虎榜",         "collector.lhb",           "run", []),
         ("市场状态计算",   "calculator.market_state", "run", []),
         ("个股衍生指标",   "calculator.stock_derived","run", []),
