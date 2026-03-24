@@ -11,6 +11,7 @@
 """
 
 import logging
+import os
 import time
 from datetime import date
 from typing import Optional
@@ -28,7 +29,9 @@ BOARD_SHENZHEN = "深股通"
 
 def fetch_northbound(target_date: date = None, retries: int = MAX_RETRIES) -> Optional[dict]:
     """
-    从 AKShare 获取北向资金数据，提取指定日期的沪股通和深股通数据
+    双源获取北向资金：
+      1) 主源：Tushare moneyflow_hsgt（需要 TUSHARE_TOKEN）
+      2) 备源：AKShare stock_hsgt_fund_flow_summary_em
 
     :param target_date: 目标日期，默认今天
     :param retries:     最大重试次数
@@ -43,26 +46,121 @@ def fetch_northbound(target_date: date = None, retries: int = MAX_RETRIES) -> Op
     }
     失败时返回 None（网络异常且重试耗尽）
     """
-    import akshare as ak
-
     if target_date is None:
         target_date = date.today()
+
+    tushare_data = _fetch_from_tushare(target_date)
+    if tushare_data and tushare_data.get("data_available"):
+        return tushare_data
+
+    if tushare_data:
+        logger.warning("[northbound] Tushare 无可用数据，回退 AKShare")
+    else:
+        logger.info("[northbound] Tushare 不可用或未配置，回退 AKShare")
+
+    ak_data = _fetch_from_akshare(target_date, retries=retries)
+    if ak_data is None:
+        return None
+
+    # 避免“接口异常全 0”误导下游模型
+    if _looks_like_all_zero_anomaly(ak_data):
+        ak_data["data_available"] = False
+        ak_data["warning"] = "AKShare 返回核心资金字段全 0，疑似数据源异常，已标记不可用"
+        logger.warning(f"[northbound] {target_date} 疑似异常全0，按不可用处理")
+    return ak_data
+
+
+def _base_result(target_date: date, source: str) -> dict:
+    return {
+        "date": target_date,
+        "source": source,
+        "sh_net_buy": None,
+        "sz_net_buy": None,
+        "total_net_buy": None,
+        "sh_quota_left": None,
+        "sz_quota_left": None,
+        "data_available": False,
+        "warning": None,
+    }
+
+
+def _fetch_from_tushare(target_date: date) -> Optional[dict]:
+    """
+    主源：Tushare moneyflow_hsgt
+    文档单位通常为百万元，这里统一转换为“亿元”
+    """
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        return None
+
+    try:
+        import pandas as pd
+        import tushare as ts
+
+        pro = ts.pro_api(token)
+        trade_date = target_date.strftime("%Y%m%d")
+        df = pro.moneyflow_hsgt(trade_date=trade_date)
+        result = _base_result(target_date, source="tushare")
+
+        if df is None or df.empty:
+            result["warning"] = "Tushare 未返回当日北向资金数据"
+            return result
+
+        row = df.iloc[0]
+
+        def get_num(key: str) -> Optional[float]:
+            if key not in row.index:
+                return None
+            val = row[key]
+            if pd.isna(val):
+                return None
+            # 百万元 -> 亿元
+            return round(float(val) / 100.0, 2)
+
+        result["sh_net_buy"] = get_num("hgt")
+        result["sz_net_buy"] = get_num("sgt")
+
+        north = get_num("north_money")
+        if north is not None:
+            result["total_net_buy"] = north
+        elif result["sh_net_buy"] is not None and result["sz_net_buy"] is not None:
+            result["total_net_buy"] = round(result["sh_net_buy"] + result["sz_net_buy"], 2)
+
+        result["data_available"] = any(
+            v is not None for v in [
+                result["sh_net_buy"],
+                result["sz_net_buy"],
+                result["total_net_buy"],
+            ]
+        )
+        if not result["data_available"]:
+            result["warning"] = "Tushare 返回记录存在，但关键字段为空"
+        return result
+    except Exception as e:
+        logger.warning(f"[northbound] Tushare 请求失败: {e}")
+        return None
+
+
+def _fetch_from_akshare(target_date: date, retries: int = MAX_RETRIES) -> Optional[dict]:
+    """备源：AKShare stock_hsgt_fund_flow_summary_em"""
+    import akshare as ak
 
     last_error = None
     for attempt in range(1, retries + 1):
         try:
-            logger.info(f"[northbound] 第 {attempt} 次请求...")
+            logger.info(f"[northbound] AKShare 第 {attempt} 次请求...")
             df = ak.stock_hsgt_fund_flow_summary_em()
-            return _parse_northbound(df, target_date)
-
+            result = _parse_northbound(df, target_date)
+            result["source"] = "akshare"
+            return result
         except Exception as e:
             last_error = e
-            logger.warning(f"[northbound] 第 {attempt} 次请求失败: {e}")
+            logger.warning(f"[northbound] AKShare 第 {attempt} 次请求失败: {e}")
             if attempt < retries:
                 logger.info(f"[northbound] {RETRY_DELAY}s 后重试...")
                 time.sleep(RETRY_DELAY)
 
-    logger.error(f"[northbound] 重试 {retries} 次后仍失败: {last_error}")
+    logger.error(f"[northbound] AKShare 重试 {retries} 次后仍失败: {last_error}")
     return None
 
 
@@ -75,15 +173,7 @@ def _parse_northbound(df, target_date: date) -> dict:
       数据已按日期降序排列，金额单位已转换为亿元
     """
 
-    result = {
-        "date":           target_date,
-        "sh_net_buy":     None,
-        "sz_net_buy":     None,
-        "total_net_buy":  None,
-        "sh_quota_left":  None,
-        "sz_quota_left":  None,
-        "data_available": False,
-    }
+    result = _base_result(target_date, source="akshare")
 
     if df is None or df.empty:
         logger.warning("[northbound] 接口返回空数据")
@@ -123,6 +213,22 @@ def _validate_columns(df):
         raise ValueError(f"[northbound] AKShare 返回字段缺失: {missing}，请检查接口是否变更")
 
 
+def _looks_like_all_zero_anomaly(data: dict) -> bool:
+    """
+    识别疑似“数据源异常全0”。
+    仅在 AKShare 路径生效，防止把 0.00 当成真实净流入。
+    """
+    nums = [
+        data.get("sh_net_buy"),
+        data.get("sz_net_buy"),
+        data.get("total_net_buy"),
+        data.get("sh_quota_left"),
+        data.get("sz_quota_left"),
+    ]
+    vals = [v for v in nums if v is not None]
+    return bool(vals) and all(v == 0 for v in vals)
+
+
 def _safe_float(row_df, col: str) -> Optional[float]:
     """安全提取单行 DataFrame 中的浮点数，空行或 NaN 返回 None"""
     import pandas as pd
@@ -150,9 +256,13 @@ def save_northbound(data: dict):
     d = data["date"]
 
     if not data["data_available"]:
+        warning = data.get("warning")
+        source = data.get("source", "unknown")
         content = (
             f"# 北向资金 {d.strftime('%Y-%m-%d')}\n\n"
             f"> ⚠️ 当日无数据（非交易日或接口暂未更新）\n"
+            + (f"> 数据源: {source}\n" if source else "")
+            + (f"> 说明: {warning}\n" if warning else "")
         )
         write_md(NORTHBOUND_DIR, date_to_filename(d), content)
         logger.warning(f"[northbound] {d} 写入缺失标记")
@@ -173,6 +283,7 @@ def save_northbound(data: dict):
     ]
     content = (
         f"# 北向资金 {d.strftime('%Y-%m-%d')}\n\n"
+        + (f"> 数据源: {data.get('source', 'unknown')}\n\n")
         + rows_to_md_table(["指标", "数值"], rows)
     )
     write_md(NORTHBOUND_DIR, date_to_filename(d), content)
